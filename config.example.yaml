@@ -1,0 +1,67 @@
+# Aegis - API Key & Security Governance Proxy
+# Configuration File
+
+server:
+  addr: ":8080"
+  admin_addr: ":9090"
+  read_timeout_sec: 30
+  write_timeout_sec: 60
+  idle_timeout_sec: 120
+
+logging:
+  level: "info"    # debug, info, warn, error
+  format: "text"   # text, json
+
+# Provider routing: maps URL path prefixes to upstream APIs
+providers:
+  - name: "openai"
+    prefix: "/v1/openai"
+    upstream: "https://api.openai.com"
+  - name: "anthropic"
+    prefix: "/v1/anthropic"
+    upstream: "https://api.anthropic.com"
+  - name: "gemini"
+    prefix: "/v1/gemini"
+    upstream: "https://generativelanguage.googleapis.com"
+
+# Security & egress filtering
+security:
+  mode: "open"  # allowlist, denylist, open
+  allowlist_domains: []
+  denylist_domains: []
+  strip_headers:
+    - "Authorization"
+    - "x-api-key"
+    - "api-key"
+  credentials:
+    - domain: "api.openai.com"
+      header: "Authorization"
+      value_env: "OPENAI_API_KEY"
+      prefix: "Bearer "
+    - domain: "api.anthropic.com"
+      header: "x-api-key"
+      value_env: "ANTHROPIC_API_KEY"
+      prefix: ""
+  leak_detection:
+    enabled: true
+    mode: "warn"
+
+# Caching configuration
+cache:
+  enabled: false
+  backend: "memory"  # memory, sqlite, redis
+  sqlite_path: "~/.aegis/cache.db"
+  redis_addr: "localhost:6379"
+  max_memory_mb: 256
+  rules:
+    - match: "api.openai.com/v1/embeddings"
+      ttl: "24h"
+    - match: "api.openai.com/v1/models"
+      ttl: "1h"
+
+# Budget & rate limiting
+budget:
+  enabled: false
+  default_monthly_limit: 100.00
+  db_path: "~/.aegis/budget.db"
+  limits: []
