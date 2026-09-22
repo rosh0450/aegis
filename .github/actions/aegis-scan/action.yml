@@ -1,0 +1,68 @@
+name: 'Aegis API Key Scan'
+description: 'Scan your codebase for accidentally committed API keys using Aegis detection engine'
+
+inputs:
+  scan-path:
+    description: 'Path to scan for API keys'
+    required: false
+    default: '.'
+  fail-on-detection:
+    description: 'Fail the action if API keys are detected'
+    required: false
+    default: 'true'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.23'
+
+    - name: Build scanner
+      shell: bash
+      run: |
+        cd ${{ github.action_path }}/../../..
+        go build -o /tmp/aegis-scanner ./cmd/aegis
+
+    - name: Scan for API keys
+      shell: bash
+      run: |
+        echo "🔍 Scanning for API keys in ${{ inputs.scan-path }}..."
+        # Use find + grep to scan files, excluding common non-code directories
+        FOUND=0
+        while IFS= read -r -d '' file; do
+          # Skip binary files and common non-code paths
+          if file "$file" | grep -qE 'text|JSON|YAML'; then
+            MATCHES=$(grep -nEo '(sk-[a-zA-Z0-9]{20,}|sk-proj-[a-zA-Z0-9_-]{20,}|sk-ant-[a-zA-Z0-9_-]{20,}|AIza[0-9A-Za-z_-]{35}|(AKIA|ASIA)[A-Z0-9]{16}|(sk|pk)_(test|live)_[a-zA-Z0-9]{20,})' "$file" 2>/dev/null || true)
+            if [ -n "$MATCHES" ]; then
+              echo "⚠️  Potential API key(s) found in: $file"
+              echo "$MATCHES" | while read -r match; do
+                LINE=$(echo "$match" | cut -d: -f1)
+                KEY=$(echo "$match" | cut -d: -f2- | head -c 12)...
+                echo "   Line $LINE: ${KEY}"
+              done
+              FOUND=1
+            fi
+          fi
+        done < <(find "${{ inputs.scan-path }}" -type f \
+          -not -path '*/node_modules/*' \
+          -not -path '*/.git/*' \
+          -not -path '*/vendor/*' \
+          -not -path '*/.aegis/*' \
+          -not -path '*/bin/*' \
+          -not -name '*.exe' \
+          -not -name '*.bin' \
+          -not -name '*.so' \
+          -not -name '*.dylib' \
+          -print0)
+
+        if [ "$FOUND" -eq 1 ]; then
+          echo ""
+          echo "❌ API keys detected in codebase!"
+          if [ "${{ inputs.fail-on-detection }}" = "true" ]; then
+            exit 1
+          fi
+        else
+          echo "✅ No API keys detected."
+        fi

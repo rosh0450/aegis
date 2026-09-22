@@ -13,9 +13,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/rishavkumarj/aegis/internal/admin"
+	"github.com/rishavkumarj/aegis/internal/budget"
+	"github.com/rishavkumarj/aegis/internal/cache"
 	"github.com/rishavkumarj/aegis/internal/config"
 	"github.com/rishavkumarj/aegis/internal/middleware"
 	"github.com/rishavkumarj/aegis/internal/proxy"
+	"github.com/rishavkumarj/aegis/internal/security"
 	"github.com/rishavkumarj/aegis/internal/transport"
 )
 
@@ -27,9 +31,10 @@ const shutdownTimeout = 15 * time.Second
 // It owns the wired dependency graph from config through to the HTTP server
 // and handles graceful startup and shutdown.
 type Server struct {
-	cfg        *config.Config
-	httpServer *http.Server
-	logger     *slog.Logger
+	cfg         *config.Config
+	httpServer  *http.Server
+	adminServer *http.Server
+	logger      *slog.Logger
 }
 
 // NewServer creates a new Server from the given config.
@@ -51,15 +56,74 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	base := transport.NewTransport()
 
 	// --- Middleware chain --------------------------------------------------
-	chain := middleware.Chain(
-		base,
+	// Order (outermost-first on request path):
+	//   1. Logging     – log every request/response
+	//   2. Allowlist   – block disallowed domains early
+	//   3. RateLimit   – enforce RPM limits per host
+	//   4. Sanitize    – scan request body for leaked API keys
+	//   5. Credential  – strip client auth headers, inject real keys
+	//   6. Cache       – return cached responses, deduplicate in-flight
+	detector := security.NewDetector()
+
+	// Build middleware list (always-on layers first).
+	metrics := middleware.NewMetrics()
+
+	middlewares := []middleware.Middleware{
+		middleware.NewMetricsMiddleware(metrics),
 		middleware.NewLoggingMiddleware(logger),
 		middleware.NewAllowlistMiddleware(
 			cfg.Security.Mode,
 			cfg.Security.AllowlistDomains,
 			cfg.Security.DenylistDomains,
 		),
-	)
+		middleware.NewRateLimitMiddleware(
+			middleware.RateLimitConfig{RequestsPerMinute: 0}, // unlimited by default
+			logger,
+		),
+		middleware.NewSanitizeMiddleware(
+			cfg.Security.LeakDetection.Mode,
+			detector,
+			logger,
+		),
+		middleware.NewCredentialMiddleware(
+			cfg.Security.Credentials,
+			cfg.Security.StripHeaders,
+			logger,
+		),
+	}
+
+	// Optionally add cache middleware when enabled.
+	var cacheStore cache.Store
+	if cfg.Cache.Enabled {
+		cacheStore = cache.NewMemoryStore(10000) // 10k entries max
+		var cacheRules []middleware.CacheRule
+		for _, r := range cfg.Cache.Rules {
+			ttl, _ := time.ParseDuration(r.TTL)
+			cacheRules = append(cacheRules, middleware.CacheRule{
+				Pattern: r.Match,
+				TTL:     ttl,
+			})
+		}
+		middlewares = append(middlewares, middleware.NewCacheMiddleware(cacheStore, cacheRules, logger))
+		logger.Info("cache middleware enabled", "backend", cfg.Cache.Backend, "rules", len(cacheRules))
+	}
+
+	chain := middleware.Chain(base, middlewares...)
+
+	// --- Budget tracker ---------------------------------------------------
+	catalog := budget.NewPricingCatalog()
+	tracker := budget.NewTracker(catalog, cfg.Budget.DefaultMonthlyLimit)
+	for _, lim := range cfg.Budget.Limits {
+		if lim.Developer != "" {
+			tracker.SetLimit(lim.Developer, lim.MonthlyLimit)
+		}
+	}
+	if cfg.Budget.Enabled {
+		logger.Info("budget tracking enabled",
+			"default_limit", cfg.Budget.DefaultMonthlyLimit,
+			"custom_limits", len(cfg.Budget.Limits),
+		)
+	}
 
 	// --- Provider registry ------------------------------------------------
 	providers := cfg.Providers
@@ -77,7 +141,7 @@ func NewServer(cfg *config.Config) (*Server, error) {
 	fwd := proxy.NewForwardProxy(registry, chain, logger)
 	handler := proxy.NewHandler(fwd, logger)
 
-	// --- HTTP server ------------------------------------------------------
+	// --- HTTP server (main proxy) -----------------------------------------
 	srv := &http.Server{
 		Addr:         cfg.Server.Addr,
 		Handler:      handler,
@@ -86,10 +150,20 @@ func NewServer(cfg *config.Config) (*Server, error) {
 		IdleTimeout:  time.Duration(cfg.Server.IdleTimeoutSec) * time.Second,
 	}
 
+	// --- Admin server (metrics + budget + cache stats) --------------------
+	adminHandler := admin.NewHandler(tracker, cacheStore, registry, logger)
+	adminSrv := &http.Server{
+		Addr:         cfg.Server.AdminAddr,
+		Handler:      adminHandler,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+	}
+
 	return &Server{
-		cfg:        cfg,
-		httpServer: srv,
-		logger:     logger,
+		cfg:         cfg,
+		httpServer:  srv,
+		adminServer: adminSrv,
+		logger:      logger,
 	}, nil
 }
 
@@ -103,7 +177,15 @@ func (s *Server) Run(ctx context.Context) error {
 	ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Start the HTTP server in a separate goroutine.
+	// Start the admin server in a separate goroutine.
+	go func() {
+		s.logger.Info("starting admin server", "addr", s.adminServer.Addr)
+		if err := s.adminServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			s.logger.Error("admin server error", "error", err)
+		}
+	}()
+
+	// Start the main HTTP server in a separate goroutine.
 	errCh := make(chan error, 1)
 	go func() {
 		s.logger.Info("starting aegis proxy", "addr", s.httpServer.Addr)
@@ -125,8 +207,17 @@ func (s *Server) Run(ctx context.Context) error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
+	// Shutdown both servers.
+	var errs []error
 	if err := s.httpServer.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("app: graceful shutdown failed: %w", err)
+		errs = append(errs, fmt.Errorf("proxy server: %w", err))
+	}
+	if err := s.adminServer.Shutdown(shutdownCtx); err != nil {
+		errs = append(errs, fmt.Errorf("admin server: %w", err))
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("app: graceful shutdown failed: %v", errs)
 	}
 
 	s.logger.Info("server stopped gracefully")
